@@ -11,6 +11,9 @@ import yaml
 from .library.validate import validate_solution_file
 
 
+EX_DATAERR: int = 65
+
+
 def filter_soup():
     """Main."""
     parser = argparse.ArgumentParser(
@@ -62,7 +65,7 @@ def taste_soup():
         print("\033[92mValid solution file.\033[0m")
     else:
         print("\033[91mInvalid solution file.\033[0m")
-        sys.exit(os.EX_DATAERR)
+        sys.exit(EX_DATAERR)
 
 
 def select_ingredients():

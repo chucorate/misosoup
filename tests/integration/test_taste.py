@@ -2,6 +2,8 @@
 import subprocess
 import os
 
+from misosoup.utilities import EX_DATAERR
+
 
 def test_installation():
     """Check installation."""
@@ -24,7 +26,7 @@ def test_invalid_solution():
         ],
         check=False,
     )
-    assert complete_process.returncode == os.EX_DATAERR
+    assert complete_process.returncode == EX_DATAERR
 
 
 def test_valid_solution():
