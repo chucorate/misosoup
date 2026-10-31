@@ -158,15 +158,29 @@ class LayeredCommunity(Community):
             for r_id, rxn in model.reactions.items():
                 new_rxn_id = rename(r_id)
 
-                if rxn.reaction_type == ReactionType.EXCHANGE and r_id.startswith(
-                    "R_EX"
-                ):
+                is_external_exchange: bool = (
+                    rxn.reaction_type == ReactionType.EXCHANGE
+                    and r_id.startswith("R_EX")
+                    # check if the single metabolite is in an external compartment
+                    # this avoids treating internal demand reactions as exchange ones
+                    and r_id != model.biomass_reaction
+                    and model.compartments[
+                        model.metabolites[list(rxn.stoichiometry.keys())[0]].compartment
+                    ].external
+                )
+
+                if is_external_exchange:
+                    if len(rxn.stoichiometry) != 1:
+                        logging.warning(
+                            "External exchange %s in organism %s "
+                            "must contain exactly one metabolite", r_id, org_id
+                        )
+
                     new_rxn_id = new_rxn_id + self.suffix
 
                     # assumes the exchange reaction is of the form {m_id: -1}
-                    m_id = list(rxn.stoichiometry.keys())[0]
-                    ext_m_id = comm_biomass_id if r_id == model.biomass_reaction else m_id
-                    int_m_id = rename(m_id)
+                    ext_m_id = list(rxn.stoichiometry.keys())[0]
+                    int_m_id = rename(ext_m_id)
 
                     if ext_m_id in ext_mets_ids:
                         original_exchange_ids_by_met.setdefault(ext_m_id, set()).add(r_id)
@@ -226,11 +240,10 @@ class LayeredCommunity(Community):
         }
 
         for m_id, r_id in self._ext_met_exchange_map.items():
-            # setup_medium skips other names, leaving environmental uptake open
+            # exchange selection and solution validation requires this naming convention
             if not r_id.startswith("R_EX_") or r_id.endswith("_i"):
                 raise ValueError(
-                    f"Environmental exchange {r_id!r} must start with 'R_EX_' "
-                    "and must not end with '_i' so setup_medium can constrain uptake"
+                    f"Environmental exchange {r_id!r} must start with 'R_EX_' and must not end with '_i'."
                 )
 
             rxn = CBReaction(
@@ -356,22 +369,21 @@ class LayeredCommunity(Community):
             )
         self.solver.update()
 
-    def setup_medium(self, medium):
+    def setup_medium(self, medium: Mapping[str, float]) -> None:
         """Setup the medium for model on solver."""
         missing_reactions = set(medium.keys()) - set(self.merged_model.reactions.keys())
         for r_id in sorted(missing_reactions):
             logging.warning(
                 "Missing reaction %s in model %s", r_id, self.merged_model.id
             )
-        for r_id in self.merged_model.reactions.keys():
-            if r_id.startswith("R_EX_") and not r_id.endswith("_i"):
-                bound = medium[r_id] if r_id in medium.keys() else 0
-                self.solver.add_constraint(
-                    f"c_{r_id}_lb",
-                    {r_id: 1},
-                    ">",
-                    bound,
-                )
+        for r_id in self._ext_met_exchange_map.values():
+            bound = medium.get(r_id, 0)
+            self.solver.add_constraint(
+                f"c_{r_id}_lb",
+                {r_id: 1},
+                ">",
+                bound,  # type: ignore
+            )
 
     def setup_parsimony(self):
         # add absolute variables for each reaction
