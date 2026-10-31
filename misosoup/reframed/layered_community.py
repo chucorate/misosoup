@@ -227,7 +227,7 @@ class LayeredCommunity(Community):
                 if reaction.lb * reaction.ub > 0:
                     lbound = -BOUND_INF if math.isinf(reaction.lb) else reaction.lb
                     ubound = BOUND_INF if math.isinf(reaction.ub) else reaction.ub
-                    self.solver.set_bounds({merged_id: (-BOUND_INF, BOUND_INF)})
+                    self.solver.reset_bounds({merged_id: (-BOUND_INF, BOUND_INF)})
 
                 self.solver.add_constraint(
                     f"c_{merged_id}_lb",
