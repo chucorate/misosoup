@@ -2,6 +2,8 @@
 
 import logging
 import math
+from collections import Counter
+from typing import Mapping, Optional
 
 from gurobipy import Env
 from reframed import (
@@ -15,7 +17,7 @@ from reframed import (
     Protein,
     ReactionType,
 )
-from reframed.solvers.solver import VarType
+from reframed.solvers.solver import Parameter, VarType
 
 from ..reframed.gurobi_env_solver import GurobiEnvSolver
 
@@ -30,12 +32,34 @@ class LayeredCommunity(Community):
     def __init__(
         self,
         community_id: str,
-        models: list,
-        env: Env = None,
-        copy_models=False,
-        suffix="_i",
-        params=None,
-    ):
+        models: list[CBModel],
+        env: Optional[Env] = None,
+        copy_models: bool = False,
+        suffix: str = "_i",
+        params: Optional[dict[Parameter, float]] = None,
+        _exchange_map: Optional[dict[str, str]] = None,
+    ) -> None:
+        """
+        Initialize a layered community.
+
+        Parameters
+        ----------
+        community_id : str
+            Identifier of the merged model.
+        models : list[CBModel]
+            Organism models to merge.
+        env : Env, optional
+            Gurobi environment; defaults to the shared environment.
+        copy_models : bool, optional
+            Whether to copy the organism models.
+        suffix : str, optional
+            Suffix for organism-local exchange reactions.
+        params : dict[Parameter, float], optional
+            Solver parameters.
+        exchange_map : dict[str, str], optional
+            Environmental reaction IDs keyed by shared metabolite ID. Pass the
+            parent community's map when rebuilding a subset.
+        """
         super().__init__(
             community_id=community_id,
             models=models,
@@ -46,42 +70,49 @@ class LayeredCommunity(Community):
             env = self.default_environment
 
         self.suffix = suffix
+        self._ext_met_exchange_map: dict[str, str] = (
+            _exchange_map if _exchange_map is not None else {}
+        )
+
         self.solver = GurobiEnvSolver(model=self.merged_model, env=env, params=params)
         self.has_binary_variables = False
 
-    def merge_models(self):
+    def merge_models(self) -> CBModel:
+        """Merge organism models into a community model."""
         comm_model = CBModel(self.id)
         old_ext_comps = []
-        ext_mets = []
+        ext_mets_ids: set[str] = set()
+        original_exchange_ids_by_met: dict[str, set[str]] = {}
+
         self.reaction_map = {}
         self.metabolite_map = {}
 
         # default IDs
         ext_comp_id = "ext"
-        biomass_id = "community_biomass"
+        comm_biomass_id = "community_biomass"
         comm_growth = "community_growth"
 
         # create external compartment
 
-        comp = Compartment(ext_comp_id, "extracellular environment", external=True)
-        comm_model.add_compartment(comp)
+        ext_comp = Compartment(ext_comp_id, "extracellular environment", external=True)
+        comm_model.add_compartment(ext_comp)
 
         # community biomass
 
-        met = Metabolite(biomass_id, "Total community biomass", ext_comp_id)
-        comm_model.add_metabolite(met)
+        comm_biomass_met = Metabolite(comm_biomass_id, "Total community biomass", ext_comp_id)
+        comm_model.add_metabolite(comm_biomass_met)
 
-        rxn = CBReaction(
+        comm_biomass_rxn = CBReaction(
             comm_growth,
             name="Community growth rate",
             reversible=False,
-            stoichiometry={biomass_id: -1},
+            stoichiometry={comm_biomass_id: -1},
             lb=0,
             ub=math.inf,
             objective=1,
         )
 
-        comm_model.add_reaction(rxn)
+        comm_model.add_reaction(comm_biomass_rxn)
 
         # add each organism
         for org_id, model in self.organisms.items():
@@ -99,11 +130,11 @@ class LayeredCommunity(Community):
             # add metabolites
             for m_id, met in model.metabolites.items():
                 # always create a local metabolite
-                new_id = rename(m_id)
-                new_met = Metabolite(new_id, met.name, rename(met.compartment))
+                new_met_id = rename(m_id)
+                new_met = Metabolite(new_met_id, met.name, rename(met.compartment))
                 new_met.metadata = met.metadata.copy()
                 comm_model.add_metabolite(new_met)
-                self.metabolite_map[(org_id, m_id)] = new_id
+                self.metabolite_map[(org_id, m_id)] = new_met_id
 
                 # if the metabolite is external and not yet added to the
                 # community model, add it
@@ -114,34 +145,38 @@ class LayeredCommunity(Community):
                     new_met = Metabolite(m_id, met.name, ext_comp_id)
                     new_met.metadata = met.metadata.copy()
                     comm_model.add_metabolite(new_met)
-                    ext_mets.append(new_met.id)
+                    ext_mets_ids.add(new_met.id)
 
             # add genes
             for g_id, gene in model.genes.items():
-                new_id = rename(g_id)
-                new_gene = Gene(new_id, gene.name)
+                new_gene_id = rename(g_id)
+                new_gene = Gene(new_gene_id, gene.name)
                 new_gene.metadata = gene.metadata.copy()
                 comm_model.add_gene(new_gene)
 
             # add internal reactions
             for r_id, rxn in model.reactions.items():
-                new_id = rename(r_id)
+                new_rxn_id = rename(r_id)
 
                 if rxn.reaction_type == ReactionType.EXCHANGE and r_id.startswith(
                     "R_EX"
                 ):
-                    new_id = new_id + self.suffix
+                    new_rxn_id = new_rxn_id + self.suffix
 
+                    # assumes the exchange reaction is of the form {m_id: -1}
                     m_id = list(rxn.stoichiometry.keys())[0]
-                    ext_m_id = biomass_id if r_id == model.biomass_reaction else m_id
+                    ext_m_id = comm_biomass_id if r_id == model.biomass_reaction else m_id
                     int_m_id = rename(m_id)
+
+                    if ext_m_id in ext_mets_ids:
+                        original_exchange_ids_by_met.setdefault(ext_m_id, set()).add(r_id)
 
                     new_stoichiometry = {
                         ext_m_id: 1,
                         int_m_id: -1,
                     }
                     new_rxn = CBReaction(
-                        new_id,
+                        new_rxn_id,
                         reversible=True,
                         stoichiometry=new_stoichiometry,
                         reaction_type=ReactionType.EXCHANGE,
@@ -152,7 +187,7 @@ class LayeredCommunity(Community):
                     }
 
                     if r_id == model.biomass_reaction:
-                        new_stoichiometry[biomass_id] = 1
+                        new_stoichiometry[comm_biomass_id] = 1
 
                     if rxn.gpr is None:
                         new_gpr = None
@@ -167,7 +202,7 @@ class LayeredCommunity(Community):
                             new_gpr.proteins.append(new_protein)
 
                     new_rxn = CBReaction(
-                        new_id,
+                        new_rxn_id,
                         name=rxn.name,
                         reversible=rxn.reversible,
                         stoichiometry=new_stoichiometry,
@@ -179,12 +214,25 @@ class LayeredCommunity(Community):
 
                 comm_model.add_reaction(new_rxn)
                 new_rxn.metadata = rxn.metadata.copy()
-                self.reaction_map[(org_id, r_id)] = new_id
+                self.reaction_map[(org_id, r_id)] = new_rxn_id
 
-        # Add exchange reactions
+        if not self._ext_met_exchange_map:
+            self._build_exchange_map(comm_model, ext_mets_ids, original_exchange_ids_by_met)
 
-        for m_id in ext_mets:
-            r_id = f"R_EX_{m_id[2:]}" if m_id.startswith("M_") else f"R_EX_{m_id}"
+        # parent maps can contain metabolites belonging only to removed organisms,
+        # so only metabolites from included organisms are kept  
+        self._ext_met_exchange_map = {
+            m_id: self._ext_met_exchange_map[m_id] for m_id in sorted(ext_mets_ids)
+        }
+
+        for m_id, r_id in self._ext_met_exchange_map.items():
+            # setup_medium skips other names, leaving environmental uptake open
+            if not r_id.startswith("R_EX_") or r_id.endswith("_i"):
+                raise ValueError(
+                    f"Environmental exchange {r_id!r} must start with 'R_EX_' "
+                    "and must not end with '_i' so setup_medium can constrain uptake"
+                )
+
             rxn = CBReaction(
                 r_id,
                 reversible=True,
@@ -194,6 +242,58 @@ class LayeredCommunity(Community):
             comm_model.add_reaction(rxn)
 
         return comm_model
+
+    def _build_exchange_map(
+        self,
+        comm_model: CBModel,
+        ext_mets_ids: set[str],
+        original_exchange_ids_by_met: dict[str, set[str]],
+    ) -> None:
+        """Allocate external exchange IDs for the initial community, avoiding collisions."""
+        # the actual names of the exchange reactions are used as candidates,
+        # the exchange reaction is only reconstructed when no source exchange exists
+        candidates = {
+            metabolite_id: original_exchange_ids_by_met.get(
+                metabolite_id,
+                {
+                    f"R_EX_{metabolite_id[2:] if metabolite_id.startswith('M_') else metabolite_id}"
+                },
+            )
+            for metabolite_id in ext_mets_ids
+        }
+
+        candidate_counts = Counter(
+            reaction_id
+            for reaction_ids in candidates.values()
+            for reaction_id in reaction_ids
+        )
+
+        # reserve merged reactions and candidate IDs so suffixes cannot overwrite them
+        assigned_ids: set[str] = set(comm_model.reactions)
+        reserved_ids: set[str] = assigned_ids | set(candidate_counts)
+
+        exchange_map: dict[str, str] = {}
+
+        # sorting keeps suffix allocation independent of organism order
+        for m_id in sorted(candidates):
+            r_id = min(candidates[m_id])
+
+            # if there are collisions or the ids have already been assigned,
+            # avoid overwriting the reaction by giving them an index
+            if candidate_counts[r_id] > 1 or r_id in assigned_ids:
+                source_id = r_id
+                index = 1
+                r_id = f"{source_id}__{index}"
+
+                while r_id in reserved_ids:
+                    index += 1
+                    r_id = f"{source_id}__{index}"
+
+            exchange_map[m_id] = r_id
+            assigned_ids.add(r_id)
+            reserved_ids.add(r_id)
+
+        self._ext_met_exchange_map = exchange_map
 
     def setup_binary_variables(self, minimal_growth):
         """Setup binary variables for each organism."""

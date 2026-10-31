@@ -143,6 +143,7 @@ class Minimizer:
                 f"{selected_names}",
                 selected_models,
                 params=self.community.solver.params,
+                _exchange_map=self.community._ext_met_exchange_map,
             )
 
             community.setup_growth_requirement(self.minimal_growth)
